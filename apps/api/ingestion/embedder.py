@@ -3,128 +3,134 @@ import os
 import time
 from typing import List, Sequence
 
-import httpx
+from google import genai
+from google.genai import types, errors
 
-from graph.config import EMBEDDING_MODEL
+from graph.config import EMBEDDING_MODEL, EMBEDDING_DIM
 
+# Batch configuration
+# Uses 20-25 texts per embed request to stay within optimal request sizing
+BATCH_SIZE = 25
 
-HF_EMBEDDING_URL = (
-    f"https://router.huggingface.co/hf-inference/models/sentence-transformers/{EMBEDDING_MODEL}/pipeline/feature-extraction"
-)
-HF_BATCH_SIZE = 32
-HF_MAX_RETRIES = 5
-HF_REQUEST_TIMEOUT_SECONDS = 120.0
+# Inter-batch pause tuned to stay under free-tier token limits (assuming ~30,000 tokens/min).
+# Tune this value as needed based on workload and token budget.
+BATCH_DELAY_SECONDS = 1.0
 
-
-def _get_hf_token() -> str:
-    token = os.getenv("HF_API_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("HF_API_TOKEN is required for Hugging Face embeddings")
-    return token
+# Retry configuration
+MAX_RETRIES = 5
+BASE_RETRY_DELAY_SECONDS = 2.0
 
 
-def _normalize_embedding(embedding: List[float]) -> List[float]:
-    norm = math.sqrt(sum(value * value for value in embedding))
-    if norm == 0:
-        raise RuntimeError("Hugging Face returned a zero embedding vector")
-    return [value / norm for value in embedding]
+def _get_client() -> genai.Client:
+    api_key = os.getenv("GOOGLE_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError(
+            "GOOGLE_API_KEY environment variable is missing or empty. "
+            "Please set GOOGLE_API_KEY to use Gemini embeddings."
+        )
+    return genai.Client(api_key=api_key)
 
 
-def _coerce_embeddings(payload) -> List[List[float]]:
-    if isinstance(payload, list):
-        if not payload:
-            raise RuntimeError("Hugging Face returned an empty embedding payload")
-        if isinstance(payload[0], list):
-            return payload
-        if all(isinstance(value, (int, float)) for value in payload):
-            return [payload]
+def _normalize_vector(vector: List[float]) -> List[float]:
+    norm = math.sqrt(sum(v * v for v in vector))
+    if norm == 0.0:
+        raise ValueError("Received zero-length vector from Gemini embedding model")
+    return [v / norm for v in vector]
 
-    raise RuntimeError(
-        f"Unexpected Hugging Face embedding response shape: {type(payload).__name__}"
+
+def _embed_batch(
+    client: genai.Client,
+    texts: List[str],
+    task_type: str,
+) -> List[List[float]]:
+    config = types.EmbedContentConfig(
+        task_type=task_type,
+        output_dimensionality=EMBEDDING_DIM,
     )
-
-
-def _embed_batch(texts: List[str]) -> List[List[float]]:
-    headers = {
-        "Authorization": f"Bearer {_get_hf_token()}",
-        "Content-Type": "application/json",
-    }
-    request_inputs = texts[0] if len(texts) == 1 else texts
 
     last_error = None
-    for attempt in range(1, HF_MAX_RETRIES + 1):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = httpx.post(
-                HF_EMBEDDING_URL,
-                headers=headers,
-                json={
-                    "inputs": request_inputs,
-                    "options": {"wait_for_model": True},
-                },
-                timeout=HF_REQUEST_TIMEOUT_SECONDS,
+            response = client.models.embed_content(
+                model=EMBEDDING_MODEL,
+                contents=texts,
+                config=config,
             )
-        except httpx.RequestError as exc:
-            last_error = str(exc)
-            if attempt == HF_MAX_RETRIES:
+
+            if not response.embeddings:
+                raise RuntimeError("Gemini returned empty embeddings list")
+
+            if len(response.embeddings) != len(texts):
+                raise RuntimeError(
+                    f"Gemini returned {len(response.embeddings)} embeddings, expected {len(texts)}"
+                )
+
+            vectors: List[List[float]] = []
+            for idx, item in enumerate(response.embeddings):
+                values = item.values
+                if values is None or len(values) != EMBEDDING_DIM:
+                    actual_len = len(values) if values is not None else 0
+                    raise ValueError(
+                        f"Embedding dimension mismatch at index {idx}: "
+                        f"expected {EMBEDDING_DIM}, got {actual_len}"
+                    )
+                vectors.append(_normalize_vector([float(v) for v in values]))
+
+            return vectors
+
+        except (errors.ServerError, errors.APIError) as exc:
+            status_code = getattr(exc, "code", None)
+
+            # Do not retry 400 (Bad Request) or 403 (Forbidden)
+            if status_code in (400, 403):
+                raise
+
+            is_retryable = (
+                isinstance(exc, errors.ServerError)
+                or status_code == 429
+                or (isinstance(status_code, int) and status_code >= 500)
+            )
+            if not is_retryable:
+                raise
+
+            last_error = exc
+            if attempt == MAX_RETRIES:
                 break
-            time.sleep(min(2.0 ** attempt, 30.0))
-            continue
 
-        if response.status_code == 503:
-            try:
-                payload = response.json()
-            except ValueError:
-                payload = {}
+            # Honor Retry-After header if present
+            retry_after = None
+            if hasattr(exc, "response") and exc.response is not None:
+                headers = getattr(exc.response, "headers", {})
+                val = headers.get("retry-after") or headers.get("Retry-After")
+                if val:
+                    try:
+                        retry_after = float(val)
+                    except (ValueError, TypeError):
+                        retry_after = None
 
-            estimated_time = payload.get("estimated_time")
-            try:
-                wait_seconds = float(estimated_time) if estimated_time is not None else 2.0 ** attempt
-            except (TypeError, ValueError):
-                wait_seconds = 2.0 ** attempt
+            if retry_after is not None and retry_after > 0:
+                sleep_seconds = retry_after
+            else:
+                sleep_seconds = min(BASE_RETRY_DELAY_SECONDS * (2 ** (attempt - 1)), 60.0)
 
-            wait_seconds = min(max(wait_seconds, 1.0), 30.0)
-            last_error = payload.get("error") or response.text or "Model is starting"
-
-            if attempt == HF_MAX_RETRIES:
-                break
-
-            time.sleep(wait_seconds)
-            continue
-
-        if response.status_code >= 400:
-            raise RuntimeError(
-                "Hugging Face embedding request failed "
-                f"with status {response.status_code}: {response.text}"
-            )
-
-        try:
-            payload = response.json()
-        except ValueError as exc:
-            raise RuntimeError(
-                f"Hugging Face embedding response was not valid JSON: {response.text[:200]}"
-            ) from exc
-
-        embeddings = _coerce_embeddings(payload)
-        if len(texts) != len(embeddings):
-            raise RuntimeError(
-                "Hugging Face returned an unexpected number of embeddings "
-                f"(expected {len(texts)}, got {len(embeddings)})"
-            )
-
-        return [_normalize_embedding([float(value) for value in embedding]) for embedding in embeddings]
+            time.sleep(sleep_seconds)
 
     raise RuntimeError(
-        "Hugging Face embedding model did not become available after "
-        f"{HF_MAX_RETRIES} attempts: {last_error}"
+        f"Gemini embedding failed after {MAX_RETRIES} attempts. Last error: {last_error}"
     )
 
 
-def embed_texts(texts: str | Sequence[str]) -> List[float] | List[List[float]]:
+def embed_texts(
+    texts: str | Sequence[str],
+    task_type: str | None = None,
+) -> List[float] | List[List[float]]:
     """
-    Embed one text or many texts using Hugging Face's hosted feature-extraction API.
+    Embed one text or many texts using Google's gemini-embedding-001 via the google-genai SDK.
 
-    Returns a normalized 768-dimensional vector for a single input string, or a
-    list of normalized vectors for a sequence of strings.
+    - If texts is a single str (e.g., a query), returns a single normalized 768-dim vector (List[float]).
+      Defaults to task_type="RETRIEVAL_QUERY".
+    - If texts is a sequence of str (e.g., document chunks), returns a list of normalized 768-dim vectors (List[List[float]]).
+      Defaults to task_type="RETRIEVAL_DOCUMENT".
     """
     single_input = isinstance(texts, str)
     text_list = [texts] if single_input else list(texts)
@@ -132,9 +138,16 @@ def embed_texts(texts: str | Sequence[str]) -> List[float] | List[List[float]]:
     if not text_list:
         raise ValueError("embed_texts requires at least one text")
 
+    if task_type is None:
+        task_type = "RETRIEVAL_QUERY" if single_input else "RETRIEVAL_DOCUMENT"
+
+    client = _get_client()
     embeddings: List[List[float]] = []
-    for start in range(0, len(text_list), HF_BATCH_SIZE):
-        batch = text_list[start:start + HF_BATCH_SIZE]
-        embeddings.extend(_embed_batch(batch))
+
+    for i, start in enumerate(range(0, len(text_list), BATCH_SIZE)):
+        if i > 0 and BATCH_DELAY_SECONDS > 0:
+            time.sleep(BATCH_DELAY_SECONDS)
+        batch = text_list[start : start + BATCH_SIZE]
+        embeddings.extend(_embed_batch(client, batch, task_type=task_type))
 
     return embeddings[0] if single_input else embeddings

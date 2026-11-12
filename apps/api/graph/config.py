@@ -19,12 +19,12 @@ MIN_RELEVANT_DOCS = 1      # minimum relevant docs needed to attempt generation
 LOW_CONFIDENCE_THRESHOLD = 0.4  # below this, we note the answer is uncertain
 
 # Embedding model — must match Vector(768) in the schema
-EMBEDDING_MODEL = "multi-qa-mpnet-base-dot-v1"
+EMBEDDING_MODEL = "gemini-embedding-001"
 EMBEDDING_DIM = 768
 
 # Required env vars for runtime-critical external services
 ENVIRONMENT = os.getenv("ENVIRONMENT", "development")
-REQUIRED_ENV_VARS = ["HF_API_TOKEN"]
+REQUIRED_ENV_VARS = ["GOOGLE_API_KEY"]
 
 if ENVIRONMENT.lower() == "production":
     missing_required_env_vars = [

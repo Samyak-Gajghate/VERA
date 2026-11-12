@@ -54,7 +54,7 @@ def ingest_file(file_path: str, source_name: str, db: Session) -> int:
 
     # 3. Embed all chunks in one batch (much faster than one at a time)
     print(f"  Embedding {len(chunks)} chunks...")
-    embeddings = embed_texts(chunks)
+    embeddings = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT")
 
     # 4. Insert into database
     doc_records = []

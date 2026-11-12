@@ -30,7 +30,7 @@ def retrieve_and_rerank(
     """
 
     # Stage 1: embed the question and do cosine similarity search
-    query_embedding = embed_texts(question)
+    query_embedding = embed_texts(question, task_type="RETRIEVAL_QUERY")
 
     # pgvector <=> is cosine distance (lower = more similar)
     # 1 - distance = cosine similarity (higher = more similar)
